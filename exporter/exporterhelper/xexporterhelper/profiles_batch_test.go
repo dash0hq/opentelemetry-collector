@@ -380,6 +380,79 @@ func BenchmarkSplittingBasedOnByteSizeHugeProfiles(b *testing.B) {
 	}
 }
 
+// newSmallProfilesMessage builds one small incoming profile: a few samples whose stacks draw most frames from a corpus
+// shared by every message and the rest from frames unique to the message, so each message carries its own dictionary
+// and batching them grows the destination dictionary.
+func newSmallProfilesMessage(msg, samples, stackDepth, sharedFunctions int, uniqueFrameRatio float64) pprofile.Profiles {
+	pd := pprofile.NewProfiles()
+	dict := pd.Dictionary()
+	dict.StringTable().Append("")
+	dict.FunctionTable().AppendEmpty()
+	dict.LocationTable().AppendEmpty()
+	dict.StackTable().AppendEmpty()
+
+	locations := map[string]int32{}
+	frame := func(name string) int32 {
+		if idx, ok := locations[name]; ok {
+			return idx
+		}
+		dict.StringTable().Append(name)
+		fn := dict.FunctionTable().AppendEmpty()
+		fn.SetNameStrindex(int32(dict.StringTable().Len() - 1))
+		loc := dict.LocationTable().AppendEmpty()
+		loc.Lines().AppendEmpty().SetFunctionIndex(int32(dict.FunctionTable().Len() - 1))
+		idx := int32(dict.LocationTable().Len() - 1)
+		locations[name] = idx
+		return idx
+	}
+
+	profile := pd.ResourceProfiles().AppendEmpty().ScopeProfiles().AppendEmpty().Profiles().AppendEmpty()
+	for s := range samples {
+		stack := dict.StackTable().AppendEmpty()
+		for d := range stackDepth {
+			k := msg*samples*stackDepth + s*stackDepth + d
+			name := fmt.Sprintf("shared_fn_%d", (k*7919)%sharedFunctions)
+			if float64(k%100) < uniqueFrameRatio*100 {
+				name = fmt.Sprintf("msg_%d_fn_%d", msg, k)
+			}
+			stack.LocationIndices().Append(frame(name))
+		}
+		profile.Samples().AppendEmpty().SetStackIndex(int32(dict.StackTable().Len() - 1))
+	}
+	return pd
+}
+
+// BenchmarkMergeSplitManySmallProfilesWithOwnDictionaries batches small requests the way the exporter queue does with
+// batch.min_size set and batch.max_size unset: every incoming request is merged into the open batch until it holds
+// min_size samples. Each merge rebuilds the destination's merge index, so ns/sample grows with min_size.
+func BenchmarkMergeSplitManySmallProfilesWithOwnDictionaries(b *testing.B) {
+	const samplesPerMessage = 14
+	for _, minSize := range []int{2048, 8192} {
+		b.Run(fmt.Sprintf("min_size=%d", minSize), func(b *testing.B) {
+			messages := minSize / samplesPerMessage
+			b.ReportAllocs()
+			for b.Loop() {
+				b.StopTimer()
+				reqs := make([]Request, messages)
+				for i := range reqs {
+					reqs[i] = newProfilesRequest(newSmallProfilesMessage(i, samplesPerMessage, 24, 500, 0.1))
+				}
+				b.StartTimer()
+
+				batch := reqs[0]
+				for _, req := range reqs[1:] {
+					res, err := batch.MergeSplit(context.Background(), 0, exporterhelper.RequestSizerTypeItems, req)
+					if err != nil {
+						b.Fatal(err)
+					}
+					batch = res[0]
+				}
+			}
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*messages*samplesPerMessage), "ns/sample")
+		})
+	}
+}
+
 // profileLabels returns the original payload format of every profile across the given requests, in order.
 func profileLabels(reqs []Request) []string {
 	var out []string

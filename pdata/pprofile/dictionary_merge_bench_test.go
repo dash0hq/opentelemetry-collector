@@ -314,6 +314,28 @@ func BenchmarkDictionaryMerge(b *testing.B) {
 	})
 }
 
+// BenchmarkDictionaryMergeManySmallProfiles models an exporter-queue batch built
+// from many small requests, such as one profile per incoming message: each merge
+// carries only a few dozen dictionary entries, but the batch reaches thousands of
+// merges. A per-merge cost that scales with the destination dictionary shows up
+// here as ns/merge growing with the batch size, i.e. quadratic batch cost.
+func BenchmarkDictionaryMergeManySmallProfiles(b *testing.B) {
+	small := profileSizes{
+		strings:    150,
+		functions:  120,
+		mappings:   4,
+		locations:  120,
+		stacks:     15,
+		attributes: 4,
+	}
+	for _, batch := range []int{64, 256, 1024, 4096} {
+		b.Run(fmt.Sprintf("batch=%d", batch), func(b *testing.B) {
+			benchmarkRealisticFlush(b, small, 0.9, batch)
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*batch), "ns/merge")
+		})
+	}
+}
+
 // BenchmarkDictionaryMergeHotKey isolates the attribute table under a single hot
 // key. The realistic sweep keeps the attribute table small and its keys varied,
 // which hides how well the index spreads attributes by value; this sweep does
